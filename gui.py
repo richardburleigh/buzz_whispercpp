@@ -504,7 +504,6 @@ class RecordingTranscriberWidget(QWidget):
             ((0, 5, FormLabel('Task:')), (5, 7, self.tasks_combo_box)),
             ((0, 5, FormLabel('Language:')), (5, 7, self.languages_combo_box)),
             ((0, 5, FormLabel('Quality:')), (5, 7, self.quality_combo_box)),
-            ((0, 5, FormLabel('Microphone:')),
              (5, 7, self.audio_devices_combo_box)),
             ((0, 5, FormLabel('Delay:')), (5, 7, delays_combo_box)),
             ((6, 3, self.timer_label), (9, 3, self.record_button)),
