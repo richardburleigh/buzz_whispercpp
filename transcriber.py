@@ -1,90 +1,164 @@
-import datetime
 import enum
 import logging
 import os
-import platform
 import queue
-import subprocess
 from threading import Thread
 from typing import Callable, Optional
-
 import numpy as np
-import sounddevice
-import whisper
+import pathlib
+import ctypes
+from scipy.io import wavfile
+import sys
 
-import _whisper
+from wurlitzer import pipes
+import pyaudio
+
+import auditok
+
+sr = 16000
+sw = 2
+ch = 1
+eth = 55 # alias for energy_threshold, default value is 50
 
 # When the app is opened as a .app from Finder, the path doesn't contain /usr/local/bin
 # which breaks the call to run `ffmpeg`. This sets the path manually to fix that.
 os.environ["PATH"] += os.pathsep + "/usr/local/bin"
 
+# this needs to match the C struct in whisper.h
+class WhisperFullParams(ctypes.Structure):
+    _fields_ = [
+        ("strategy",             ctypes.c_int),
+        ("n_threads",            ctypes.c_int),
+        ("offset_ms",            ctypes.c_int),
+        ("translate",            ctypes.c_bool),
+        ("no_context",           ctypes.c_bool),
+        ("print_special_tokens", ctypes.c_bool),
+        ("print_progress",       ctypes.c_bool),
+        ("print_realtime",       ctypes.c_bool),
+        ("print_timestamps",     ctypes.c_bool),
+        ("language",             ctypes.c_char_p),
+        ("greedy",               ctypes.c_int * 1),
+    ]
 
-class State(enum.Enum):
-    STARTING_NEXT_TRANSCRIPTION = 0
-    FINISHED_CURRENT_TRANSCRIPTION = 1
 
-
-class Status:
-    def __init__(self, state: State, text='') -> None:
-        self.state = state
-        self.text = text
-
-
-class Task(enum.Enum):
-    TRANSLATE = "translate"
-    TRANSCRIBE = "transcribe"
-
-
-class RecordingTranscriber:
+class Transcriber:
     """Transcriber records audio from a system microphone and transcribes it into text using Whisper."""
 
+    class Task(enum.Enum):
+        TRANSLATE = "translate"
+        TRANSCRIBE = "transcribe"
+
     current_thread: Optional[Thread]
-    current_stream: Optional[sounddevice.InputStream]
+    #current_stream: Optional[sounddevice.InputStream]
     is_running = False
     MAX_QUEUE_SIZE = 10
 
-    def __init__(self, model: whisper.Whisper, language: Optional[str],
-                 status_callback: Callable[[Status], None], task: Task) -> None:
-        self.model = model
-        self.current_stream = None
-        self.status_callback = status_callback
+    def __init__(self, model_name: str, language: Optional[str],
+                 text_callback: Callable[[str], None], task: Task) -> None:
+        self.model_name = model_name
+
+        self.libname = pathlib.Path().absolute() / "libwhisper.so"
+        self.whisper = ctypes.CDLL(self.libname)
+        # tell Python what are the return types of the functions
+        self.whisper.whisper_init.restype                  = ctypes.c_void_p
+        self.whisper.whisper_full_default_params.restype   = WhisperFullParams
+        self.whisper.whisper_full_get_segment_text.restype = ctypes.c_char_p
+         # initialize whisper.cpp context
+        self.ctx = self.whisper.whisper_init(("models/ggml-" + self.model_name + ".bin").encode("utf-8"))
+        # get default whisper parameters and adjust as needed
+        self.params = self.whisper.whisper_full_default_params(0)
+        self.params.print_realtime = True
+        self.params.print_progress = False
+        self.params.language = language.encode()
+        self.params.translate = True
+        self.params.n_threads = os.cpu_count() - 1
+
+
+        #self.current_stream = None
+        self.text_callback = text_callback
         self.language = language
         self.task = task
         self.queue: queue.Queue[np.ndarray] = queue.Queue(
-            RecordingTranscriber.MAX_QUEUE_SIZE,
+            Transcriber.MAX_QUEUE_SIZE,
         )
+        print("Running on ", self.params.n_threads, " threads.")
 
     def start_recording(self, block_duration=10, input_device_index: Optional[int] = None):
-        sample_rate = self.get_device_sample_rate(device_id=input_device_index)
 
-        logging.debug("Recording... language: \"%s\", model: \"%s\", task: \"%s\", device: \"%s\", block duration: \"%s\", sample rate: \"%s\"" %
-                      (self.language, self.model._get_name(), self.task, input_device_index, block_duration, sample_rate))
-        self.current_stream = sounddevice.InputStream(
-            samplerate=sample_rate,
-            blocksize=block_duration * sample_rate,
-            device=input_device_index, dtype="float32",
-            channels=1, callback=self.stream_callback)
-        self.current_stream.start()
+        self.block_duration=block_duration
+
+        print("input_device_index is: ", input_device_index)
 
         self.is_running = True
 
         self.current_thread = Thread(target=self.process_queue)
         self.current_thread.start()
 
+        self.recorder = Thread(target=self.record)
+        self.recorder.start()
+
+    def record(self):
+        n = 0
+        data = None
+
+        for region in auditok.split(input=None, sr=sr, sw=sw, ch=ch, eth=eth):
+            if data == None:
+                data = region
+            else:
+                data = data + region
+            if data.duration > self.block_duration:
+                data.save(  f"tmp{n}.wav") # progress bar requires `tqdm`
+                self.queue.put(n, block=False)
+                data = None
+                n = n + 1
+
     def process_queue(self):
         while self.is_running:
             try:
                 block = self.queue.get(block=False)
+                print(self.language)
+                #print(block)
+                outfile = open("transcript.txt", "a")
                 logging.debug(
                     'Processing next frame. Current queue size: %d' % self.queue.qsize())
-                self.status_callback(Status(State.STARTING_NEXT_TRANSCRIPTION))
-                result = self.model.transcribe(
-                    audio=block, language=self.language, task=self.task.value)
-                text = result.get("text")
-                logging.debug(
-                    "Received next result of length: %s" % len(text))
-                self.status_callback(
-                    Status(State.FINISHED_CURRENT_TRANSCRIPTION, text))
+
+                wavpath=f"tmp{block}.wav"
+                wavpath = str.encode(wavpath)
+
+                # load WAV file
+                samplerate, data = wavfile.read(wavpath)
+
+                # convert to 32-bit float
+                data = data.astype('float32')/32768.0
+
+                # run the inference
+                result = self.whisper.whisper_full(ctypes.c_void_p(self.ctx), self.params, data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(data))
+                if result != 0:
+                    print("Error: {}".format(result))
+                    exit(1)
+
+
+                # print results from Python
+                txtfull = ""
+                print("\nResults from Python:\n")
+                n_segments = self.whisper.whisper_full_n_segments(ctypes.c_void_p(self.ctx))
+                for i in range(n_segments):
+                    t0  = self.whisper.whisper_full_get_segment_t0(ctypes.c_void_p(self.ctx), i)
+                    t1  = self.whisper.whisper_full_get_segment_t1(ctypes.c_void_p(self.ctx), i)
+                    txt = self.whisper.whisper_full_get_segment_text(ctypes.c_void_p(self.ctx), i)
+                    txtfull = txtfull + "\n" + txt.decode('utf-8')
+
+
+                    print(f"{t0/1000.0:.3f} - {t1/1000.0:.3f} : {txt.decode('utf-8')}")
+                os.remove(f"tmp{block}.wav")
+                outfile.write(txtfull + "\n")
+
+
+                logging.debug("Received next result: \"%s\"" % txtfull)
+                try:
+                  self.text_callback(txtfull)  # type: ignore
+                except:
+                    continue
             except queue.Empty:
                 continue
 
@@ -93,7 +167,7 @@ class RecordingTranscriber:
         provided by Whisper if the microphone supports it, or else it uses the device's default
         sample rate.
         """
-        whisper_sample_rate = whisper.audio.SAMPLE_RATE
+        whisper_sample_rate = 16000
         try:
             sounddevice.check_input_settings(
                 device=device_id, samplerate=whisper_sample_rate)
@@ -107,16 +181,16 @@ class RecordingTranscriber:
     def stream_callback(self, in_data, frame_count, time_info, status):
         # Try to enqueue the next block. If the queue is already full, drop the block.
         try:
-            chunk = in_data.ravel()
-            logging.debug('Received next chunk: length %s, amplitude %s, status "%s"'
-                          % (len(chunk), (abs(max(chunk)) + abs(min(chunk))) / 2, status))
-            self.queue.put(chunk, block=False)
+            n = self.queue.qsize() + 1
+            #sounddevice.write(f"temp{n}.wav", in_data)
+            write(f"tmp{n}.wav", 16000, in_data)
+            self.queue.put(n, block=False)
         except queue.Full:
             return
 
     def stop_recording(self):
-        if self.current_stream != None:
-            self.current_stream.close()
+        if self.recorder != None:
+            #self.recorder.close()
             logging.debug('Closed recording stream')
 
         self.is_running = False
@@ -124,53 +198,5 @@ class RecordingTranscriber:
 
         if self.current_thread != None:
             logging.debug('Waiting for processing thread to terminate')
-            self.current_thread.join()
+            #self.current_thread.join()
             logging.debug('Processing thread terminated')
-
-
-class FileTranscriber:
-    """FileTranscriber transcribes an audio file to text, writes the text to a file, and then opens the file using the default program for opening txt files."""
-
-    stopped = False
-
-    def __init__(self, model: whisper.Whisper, language: Optional[str], task: Task, file_path: str, output_file_path: str, progress_callback: Callable[[int, int], None]) -> None:
-        self.model = model
-        self.file_path = file_path
-        self.output_file_path = output_file_path
-        self.progress_callback = progress_callback
-        self.language = language
-        self.task = task
-
-    def start(self):
-        self.current_thread = Thread(target=self.transcribe)
-        self.current_thread.start()
-
-    def transcribe(self):
-        try:
-            result = _whisper.transcribe(
-                model=self.model, audio=self.file_path,
-                progress_callback=self.progress_callback,
-                language=self.language, task=self.task.value,
-                check_stopped=self.check_stopped)
-        except _whisper.Stopped:
-            return
-
-        output_file = open(self.output_file_path, 'w')
-        output_file.write(result.get('text'))
-        output_file.close()
-
-        try:
-            os.startfile(self.output_file_path)
-        except AttributeError:
-            opener = "open" if platform.system() == "Darwin" else "xdg-open"
-            subprocess.call([opener, self.output_file_path])
-
-    def stop(self):
-        self.stopped = True
-
-    def check_stopped(self):
-        return self.stopped
-
-    @classmethod
-    def get_default_output_file_path(cls, task: Task, input_file_path: str):
-        return f'{os.path.splitext(input_file_path)[0]} ({task.value.title()}d on {datetime.datetime.now():%d-%b-%Y %H-%M-%S}).txt'
