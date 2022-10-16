@@ -70,7 +70,10 @@ class Transcriber:
         self.params.print_realtime = True
         self.params.print_progress = False
         self.params.language = language.encode()
-        self.params.translate = True
+        if str(task) == "Task.TRANSLATE":
+            self.params.translate = True
+        else:
+            self.params.translate = False
         self.params.n_threads = os.cpu_count() - 1
 
 
